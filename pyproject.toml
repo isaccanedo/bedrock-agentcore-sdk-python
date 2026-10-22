@@ -1,0 +1,216 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bedrock-agentcore"
+version = "1.24.2"
+description = "An SDK for using Bedrock AgentCore"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    { name = "AWS", email = "opensource@amazon.com" }
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "boto3>=1.43.115",
+    "botocore>=1.43.115",
+    "pydantic>=2.0.0,<2.41.3",
+    "urllib3>=1.26.0",
+    "starlette>=0.46.2",
+    "typing-extensions>=4.13.2,<5.0.0",
+    "uvicorn>=0.34.2",
+    "websockets>=13.0",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[project.urls]
+Homepage = "https://github.com/aws/bedrock-agentcore-sdk-python"
+"Bug Tracker" = "https://github.com/aws/bedrock-agentcore-sdk-python/issues"
+Documentation = "https://github.com/aws/bedrock-agentcore-sdk-python"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bedrock_agentcore"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+follow_untyped_imports = true
+ignore_missing_imports = false
+
+[tool.ruff]
+line-length = 120
+include = ["examples/**/*.py", "src/**/*.py", "tests/**/*.py", "tests_integ/**/*.py"]
+exclude = ["**/*.md"]
+
+[tool.ruff.lint]
+select = [
+  "B", # flake8-bugbear
+  "D", # pydocstyle
+  "E", # pycodestyle
+  "F", # pyflakes
+  "G", # logging format
+  "I", # isort
+  "LOG", # logging
+]
+
+[tool.ruff.lint.per-file-ignores]
+"!src/**/*.py" = ["D"]
+"src/bedrock_agentcore/memory/metadata-workflow.ipynb" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-third-party = ["a2a"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+testpaths = [
+    "tests"
+]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+context = "thread"
+parallel = true
+concurrency = ["thread", "multiprocessing"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 90
+skip_covered = false
+skip_empty = false
+
+[tool.coverage.html]
+directory = "build/coverage/html"
+
+[tool.coverage.xml]
+output = "build/coverage/coverage.xml"
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "v$version"
+bump_message = "chore(release): bump version $current_version -> $new_version"
+version_files = [
+    "pyproject.toml:version",
+]
+update_changelog_on_bump = true
+style = [
+    ["qmark", "fg:#ff9d00 bold"],
+    ["question", "bold"],
+    ["answer", "fg:#ff9d00 bold"],
+    ["pointer", "fg:#ff9d00 bold"],
+    ["highlighted", "fg:#ff9d00 bold"],
+    ["selected", "fg:#cc5454"],
+    ["separator", "fg:#cc5454"],
+    ["instruction", ""],
+    ["text", ""],
+    ["disabled", "fg:#858585 italic"]
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "moto>=5.1.6",
+    "mypy>=1.16.1",
+    "pre-commit>=4.2.0",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "pytest-order>=1.3.0",
+    "pytest-rerunfailures>=15.0",
+    "ruff>=0.12.0",
+    "websockets>=14.1",
+    "wheel>=0.45.1",
+    "strands-agents>=1.56.0",
+    "strands-agents-evals>=1.0.3,<2.0.0",
+    "deepeval>=3.5.0,<5.0.0",
+    "autoevals>=0.3.0,<1.0.0",
+    "ragas>=0.4.3,<1.0.0",
+    # ragas<1.0 imports langchain_community.chat_models.vertexai, removed in 0.4.2
+    "langchain-community>=0.3.0,<0.4.2",
+    "langchain>=1.0.0",
+    "langgraph>=1.0.0",
+    "langchain-mcp-adapters>=0.1.0",
+    "a2a-sdk[http-server]>=1.0.1,<2.0",
+    "ag-ui-protocol>=0.1.10",
+    "mcp-proxy-for-aws>=0.1.0",
+]
+
+[project.optional-dependencies]
+a2a = ["a2a-sdk[http-server]>=0.3,<0.4"]
+a2a-v1 = ["a2a-sdk[http-server]>=1.0.1,<2.0"]
+ag-ui = ["ag-ui-protocol>=0.1.10"]
+strands-agents = [
+    "strands-agents>=1.56.0",
+    "mcp>=1.23.0,<2.0.0",
+]
+langgraph = [
+    "langchain>=1.0.0",
+    "langgraph>=1.0.0",
+    "langchain-mcp-adapters>=0.1.0",
+    "httpx>=0.27.0",
+]
+strands-agents-evals = [
+    "strands-agents-evals>=1.0.3,<2.0.0"
+]
+simulation = [
+    "jinja2>=3.1.0",
+    "strands-agents-evals>=1.0.3,<2.0.0",
+]
+datasets = [
+    "requests>=2.31.0",
+]
+deepeval = [
+    "deepeval>=3.5.0,<5.0.0",
+    "strands-agents-evals>=1.0.3,<2.0.0",
+]
+autoevals = [
+    "autoevals>=0.3.0,<1.0.0",
+    "strands-agents-evals>=1.0.3,<2.0.0",
+]
+ragas = [
+    "ragas>=0.4.3,<1.0.0",
+    # ragas<1.0 imports langchain_community.chat_models.vertexai, removed in 0.4.2
+    "langchain-community>=0.3.0,<0.4.2",
+    "strands-agents-evals>=1.0.3,<2.0.0",
+]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "a2a" },
+        { extra = "a2a-v1" },
+    ],
+    [
+        { extra = "a2a" },
+        { group = "dev" },
+    ],
+]

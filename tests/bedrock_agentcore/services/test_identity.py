@@ -1,0 +1,1284 @@
+"""Tests for Bedrock AgentCore Identity Client functionality."""
+
+import asyncio
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+from botocore.exceptions import ClientError
+
+from bedrock_agentcore.services.identity import (
+    DEFAULT_POLLING_INTERVAL_SECONDS,
+    DEFAULT_POLLING_TIMEOUT_SECONDS,
+    IdentityClient,
+    UserIdIdentifier,
+    UserTokenIdentifier,
+    _DefaultApiTokenPoller,
+)
+
+
+class TestIdentityClient:
+    """Test IdentityClient functionality."""
+
+    def test_initialization(self):
+        """Test IdentityClient initialization."""
+        region = "us-east-1"
+
+        with patch("boto3.client") as mock_boto_client:
+            client = IdentityClient(region)
+            assert client.region == region
+            mock_boto_client.assert_called_with(
+                "bedrock-agentcore",
+                region_name=region,
+            )
+
+    def test_create_oauth2_credential_provider(self):
+        """Test OAuth2 credential provider creation."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            expected_response = {"providerId": "test-provider-id"}
+            mock_cp_client.create_oauth2_credential_provider.return_value = expected_response
+
+            req = {"name": "test-provider", "clientId": "test-client"}
+            result = identity_client.create_oauth2_credential_provider(req)
+
+            assert result == expected_response
+            mock_cp_client.create_oauth2_credential_provider.assert_called_once_with(
+                name="test-provider",
+                clientId="test-client",
+            )
+
+    def test_create_api_key_credential_provider(self):
+        """Test API key credential provider creation."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            expected_response = {"providerId": "test-api-provider-id"}
+            mock_cp_client.create_api_key_credential_provider.return_value = expected_response
+
+            req = {"name": "test-api-provider", "apiKeyName": "test-key"}
+            result = identity_client.create_api_key_credential_provider(req)
+
+            assert result == expected_response
+            mock_cp_client.create_api_key_credential_provider.assert_called_once_with(
+                name="test-api-provider",
+                apiKeyName="test-key",
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_token_direct_response(self):
+        """Test get_token when token is returned directly."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_client = Mock()
+            mock_boto_client.return_value = mock_client
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            provider_name = "test-provider"
+            scopes = ["read", "write"]
+            agent_identity_token = "test-agent-token"
+            expected_token = "test-access-token"
+
+            mock_client.get_resource_oauth2_token.return_value = {"accessToken": expected_token}
+
+            result = await identity_client.get_token(
+                provider_name=provider_name, scopes=scopes, agent_identity_token=agent_identity_token, auth_flow="M2M"
+            )
+
+            assert result == expected_token
+            mock_client.get_resource_oauth2_token.assert_called_once_with(
+                resourceCredentialProviderName=provider_name,
+                scopes=scopes,
+                oauth2Flow="M2M",
+                workloadIdentityToken=agent_identity_token,
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_token_with_auth_url_polling(self):
+        """Test get_token with authorization URL and polling."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_client = Mock()
+            mock_boto_client.return_value = mock_client
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            provider_name = "test-provider"
+            agent_identity_token = "test-agent-token"
+            auth_url = "https://example.com/auth"
+            expected_token = "test-access-token"
+            session_uri = "https://example-federation-authorization-request/12345"
+
+            # First call returns auth URL, subsequent calls return token
+            mock_client.get_resource_oauth2_token.side_effect = [
+                {"authorizationUrl": auth_url},
+                {"accessToken": expected_token},
+                {"sessionUri": session_uri},
+            ]
+
+            # Mock the token poller
+            mock_poller = Mock()
+            mock_poller.poll_for_token = AsyncMock(return_value=expected_token)
+
+            with patch("bedrock_agentcore.services.identity._DefaultApiTokenPoller", return_value=mock_poller):
+                result = await identity_client.get_token(
+                    provider_name=provider_name, agent_identity_token=agent_identity_token, auth_flow="USER_FEDERATION"
+                )
+
+            assert result == expected_token
+            mock_poller.poll_for_token.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_get_token_with_auth_url_and_callback(self):
+        """Test get_token with authorization URL and callback function."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_client = Mock()
+            mock_boto_client.return_value = mock_client
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            provider_name = "test-provider"
+            agent_identity_token = "test-agent-token"
+            auth_url = "https://example.com/auth"
+            expected_token = "test-access-token"
+
+            # Mock callback function
+            callback_called = False
+
+            def on_auth_url(url):
+                nonlocal callback_called
+                callback_called = True
+                assert url == auth_url
+
+            mock_client.get_resource_oauth2_token.return_value = {"authorizationUrl": auth_url}
+
+            # Mock the token poller
+            mock_poller = Mock()
+            mock_poller.poll_for_token = AsyncMock(return_value=expected_token)
+
+            with patch("bedrock_agentcore.services.identity._DefaultApiTokenPoller", return_value=mock_poller):
+                result = await identity_client.get_token(
+                    provider_name=provider_name,
+                    agent_identity_token=agent_identity_token,
+                    auth_flow="USER_FEDERATION",
+                    on_auth_url=on_auth_url,
+                )
+
+            assert result == expected_token
+            assert callback_called
+            mock_poller.poll_for_token.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_get_token_with_async_callback(self):
+        """Test get_token with async authorization URL callback."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_client = Mock()
+            mock_boto_client.return_value = mock_client
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            provider_name = "test-provider"
+            agent_identity_token = "test-agent-token"
+            auth_url = "https://example.com/auth"
+            expected_token = "test-access-token"
+
+            # Mock async callback function
+            callback_called = False
+
+            async def on_auth_url(url):
+                nonlocal callback_called
+                callback_called = True
+                assert url == auth_url
+
+            mock_client.get_resource_oauth2_token.return_value = {"authorizationUrl": auth_url}
+
+            # Mock the token poller
+            mock_poller = Mock()
+            mock_poller.poll_for_token = AsyncMock(return_value=expected_token)
+
+            with patch("bedrock_agentcore.services.identity._DefaultApiTokenPoller", return_value=mock_poller):
+                result = await identity_client.get_token(
+                    provider_name=provider_name,
+                    agent_identity_token=agent_identity_token,
+                    auth_flow="USER_FEDERATION",
+                    on_auth_url=on_auth_url,
+                )
+
+            assert result == expected_token
+            assert callback_called
+            mock_poller.poll_for_token.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_get_token_with_optional_parameters(self):
+        """Test get_token with all optional parameters."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_client = Mock()
+            mock_boto_client.return_value = mock_client
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            provider_name = "test-provider"
+            scopes = ["read", "write"]
+            agent_identity_token = "test-agent-token"
+            callback_url = "https://example.com/callback"
+            force_authentication = True
+            custom_state = "myAppCustomState"
+            expected_token = "test-access-token"
+
+            mock_client.get_resource_oauth2_token.return_value = {"accessToken": expected_token}
+
+            result = await identity_client.get_token(
+                provider_name=provider_name,
+                scopes=scopes,
+                agent_identity_token=agent_identity_token,
+                auth_flow="USER_FEDERATION",
+                callback_url=callback_url,
+                force_authentication=force_authentication,
+                custom_state=custom_state,
+            )
+
+            assert result == expected_token
+            mock_client.get_resource_oauth2_token.assert_called_once_with(
+                resourceCredentialProviderName=provider_name,
+                scopes=scopes,
+                oauth2Flow="USER_FEDERATION",
+                workloadIdentityToken=agent_identity_token,
+                resourceOauth2ReturnUrl=callback_url,
+                forceAuthentication=force_authentication,
+                customState=custom_state,
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_token_with_custom_token_poller(self):
+        """Test get_token with custom token poller."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_client = Mock()
+            mock_boto_client.return_value = mock_client
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            provider_name = "test-provider"
+            agent_identity_token = "test-agent-token"
+            auth_url = "https://example.com/auth"
+            expected_token = "test-access-token"
+            force_authentication = True
+            session_uri = "https://example-federation-authorization-request/12345"
+
+            mock_client.get_resource_oauth2_token.return_value = {
+                "authorizationUrl": auth_url,
+                "sessionUri": session_uri,
+            }
+
+            # Mock custom token poller
+            custom_poller = Mock()
+            custom_poller.poll_for_token = AsyncMock(return_value=expected_token)
+
+            result = await identity_client.get_token(
+                provider_name=provider_name,
+                agent_identity_token=agent_identity_token,
+                auth_flow="USER_FEDERATION",
+                token_poller=custom_poller,
+                force_authentication=force_authentication,
+            )
+
+            assert result == expected_token
+            custom_poller.poll_for_token.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_get_token_with_custom_parameters(self):
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_client = Mock()
+            mock_boto_client.return_value = mock_client
+
+            identity_client = IdentityClient(region)
+
+            provider_name = "test-provider"
+            scopes = ["read", "write"]
+            agent_identity_token = "test-agent-token"
+            custom_parameters = {"param1": "value1", "param2": "value2"}
+            expected_token = "test-access-token"
+
+            mock_client.get_resource_oauth2_token.return_value = {"accessToken": expected_token}
+
+            result = await identity_client.get_token(
+                provider_name=provider_name,
+                scopes=scopes,
+                agent_identity_token=agent_identity_token,
+                auth_flow="USER_FEDERATION",
+                custom_parameters=custom_parameters,
+            )
+
+            assert result == expected_token
+            mock_client.get_resource_oauth2_token.assert_called_once_with(
+                resourceCredentialProviderName=provider_name,
+                scopes=scopes,
+                oauth2Flow="USER_FEDERATION",
+                workloadIdentityToken=agent_identity_token,
+                customParameters=custom_parameters,
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_token_with_resources(self):
+        """Test get_token forwards the resources list to the data plane request."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_client = Mock()
+            mock_boto_client.return_value = mock_client
+
+            identity_client = IdentityClient(region)
+
+            provider_name = "test-provider"
+            scopes = ["read"]
+            agent_identity_token = "test-agent-token"
+            resources = ["https://backend.example.com/api1", "https://backend.example.com/api2"]
+            expected_token = "test-access-token"
+
+            mock_client.get_resource_oauth2_token.return_value = {"accessToken": expected_token}
+
+            result = await identity_client.get_token(
+                provider_name=provider_name,
+                scopes=scopes,
+                resources=resources,
+                agent_identity_token=agent_identity_token,
+                auth_flow="M2M",
+            )
+
+            assert result == expected_token
+            mock_client.get_resource_oauth2_token.assert_called_once_with(
+                resourceCredentialProviderName=provider_name,
+                scopes=scopes,
+                oauth2Flow="M2M",
+                workloadIdentityToken=agent_identity_token,
+                resources=resources,
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_token_with_audiences(self):
+        """Test get_token forwards the audiences list to the data plane request."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_client = Mock()
+            mock_boto_client.return_value = mock_client
+
+            identity_client = IdentityClient(region)
+
+            provider_name = "test-provider"
+            scopes = ["read"]
+            agent_identity_token = "test-agent-token"
+            audiences = ["urn:example:cooperation", "urn:example:other"]
+            expected_token = "test-access-token"
+
+            mock_client.get_resource_oauth2_token.return_value = {"accessToken": expected_token}
+
+            result = await identity_client.get_token(
+                provider_name=provider_name,
+                scopes=scopes,
+                audiences=audiences,
+                agent_identity_token=agent_identity_token,
+                auth_flow="M2M",
+            )
+
+            assert result == expected_token
+            mock_client.get_resource_oauth2_token.assert_called_once_with(
+                resourceCredentialProviderName=provider_name,
+                scopes=scopes,
+                oauth2Flow="M2M",
+                workloadIdentityToken=agent_identity_token,
+                audiences=audiences,
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_token_with_resources_and_audiences(self):
+        """Test get_token forwards both resources and audiences together."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_client = Mock()
+            mock_boto_client.return_value = mock_client
+
+            identity_client = IdentityClient(region)
+
+            provider_name = "test-provider"
+            scopes = ["read", "write"]
+            agent_identity_token = "test-agent-token"
+            resources = ["https://backend.example.com/api"]
+            audiences = ["urn:example:cooperation"]
+            expected_token = "test-access-token"
+
+            mock_client.get_resource_oauth2_token.return_value = {"accessToken": expected_token}
+
+            result = await identity_client.get_token(
+                provider_name=provider_name,
+                scopes=scopes,
+                resources=resources,
+                audiences=audiences,
+                agent_identity_token=agent_identity_token,
+                auth_flow="ON_BEHALF_OF_TOKEN_EXCHANGE",
+            )
+
+            assert result == expected_token
+            mock_client.get_resource_oauth2_token.assert_called_once_with(
+                resourceCredentialProviderName=provider_name,
+                scopes=scopes,
+                oauth2Flow="ON_BEHALF_OF_TOKEN_EXCHANGE",
+                workloadIdentityToken=agent_identity_token,
+                resources=resources,
+                audiences=audiences,
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_token_empty_resources_and_audiences_not_forwarded(self):
+        """Test get_token does not forward empty/None resources or audiences."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_client = Mock()
+            mock_boto_client.return_value = mock_client
+
+            identity_client = IdentityClient(region)
+
+            provider_name = "test-provider"
+            scopes = ["read"]
+            agent_identity_token = "test-agent-token"
+            expected_token = "test-access-token"
+
+            mock_client.get_resource_oauth2_token.return_value = {"accessToken": expected_token}
+
+            # Pass empty list and None — neither should appear in the request
+            result = await identity_client.get_token(
+                provider_name=provider_name,
+                scopes=scopes,
+                resources=[],
+                audiences=None,
+                agent_identity_token=agent_identity_token,
+                auth_flow="M2M",
+            )
+
+            assert result == expected_token
+            call_kwargs = mock_client.get_resource_oauth2_token.call_args.kwargs
+            assert "resources" not in call_kwargs
+            assert "audiences" not in call_kwargs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_flow", ["M2M", "USER_FEDERATION", "ON_BEHALF_OF_TOKEN_EXCHANGE"])
+    async def test_get_token_all_auth_flows(self, auth_flow):
+        """Test get_token forwards each supported auth_flow to the data plane request."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_client = Mock()
+            mock_boto_client.return_value = mock_client
+
+            identity_client = IdentityClient(region)
+
+            provider_name = "test-provider"
+            scopes = ["read"]
+            agent_identity_token = "test-agent-token"
+            expected_token = "test-access-token"
+
+            mock_client.get_resource_oauth2_token.return_value = {"accessToken": expected_token}
+
+            result = await identity_client.get_token(
+                provider_name=provider_name,
+                scopes=scopes,
+                agent_identity_token=agent_identity_token,
+                auth_flow=auth_flow,
+            )
+
+            assert result == expected_token
+            mock_client.get_resource_oauth2_token.assert_called_once_with(
+                resourceCredentialProviderName=provider_name,
+                scopes=scopes,
+                oauth2Flow=auth_flow,
+                workloadIdentityToken=agent_identity_token,
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_api_key_success(self):
+        """Test successful API key retrieval."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_client = Mock()
+            mock_boto_client.return_value = mock_client
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            provider_name = "test-provider"
+            agent_identity_token = "test-agent-token"
+            expected_api_key = "test-api-key"
+
+            mock_client.get_resource_api_key.return_value = {"apiKey": expected_api_key}
+
+            result = await identity_client.get_api_key(
+                provider_name=provider_name, agent_identity_token=agent_identity_token
+            )
+
+            assert result == expected_api_key
+            mock_client.get_resource_api_key.assert_called_once_with(
+                resourceCredentialProviderName=provider_name, workloadIdentityToken=agent_identity_token
+            )
+
+    def test_get_workload_access_token_with_user_token(self):
+        """Test get_workload_access_token with user token."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            workload_name = "test-workload"
+            user_token = "test-user-jwt-token"
+            user_id = "test-user-id"  # This should be ignored when user_token is provided
+            expected_response = {"workloadAccessToken": "test-workload-token"}
+
+            mock_dp_client.get_workload_access_token_for_jwt.return_value = expected_response
+
+            result = identity_client.get_workload_access_token(workload_name, user_token=user_token, user_id=user_id)
+
+            assert result == expected_response
+            mock_dp_client.get_workload_access_token_for_jwt.assert_called_once_with(
+                workloadName=workload_name, userToken=user_token
+            )
+            # Should not call the user_id version
+            mock_dp_client.get_workload_access_token_for_user_id.assert_not_called()
+            mock_dp_client.get_workload_access_token.assert_not_called()
+
+    def test_get_workload_access_token_with_user_id(self):
+        """Test get_workload_access_token with user ID."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            workload_name = "test-workload"
+            user_id = "test-user-id"
+            expected_response = {"workloadAccessToken": "test-workload-token"}
+
+            mock_dp_client.get_workload_access_token_for_user_id.return_value = expected_response
+
+            result = identity_client.get_workload_access_token(workload_name, user_id=user_id)
+
+            assert result == expected_response
+            mock_dp_client.get_workload_access_token_for_user_id.assert_called_once_with(
+                workloadName=workload_name, userId=user_id
+            )
+            # Should not call other versions
+            mock_dp_client.get_workload_access_token_for_jwt.assert_not_called()
+            mock_dp_client.get_workload_access_token.assert_not_called()
+
+    def test_get_workload_access_token_without_user_info(self):
+        """Test get_workload_access_token without user token or ID."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            workload_name = "test-workload"
+            expected_response = {"workloadAccessToken": "test-workload-token"}
+
+            mock_dp_client.get_workload_access_token.return_value = expected_response
+
+            result = identity_client.get_workload_access_token(workload_name)
+
+            assert result == expected_response
+            mock_dp_client.get_workload_access_token.assert_called_once_with(workloadName=workload_name)
+            # Should not call user-specific versions
+            mock_dp_client.get_workload_access_token_for_jwt.assert_not_called()
+            mock_dp_client.get_workload_access_token_for_user_id.assert_not_called()
+
+    def test_create_workload_identity(self):
+        """Test create_workload_identity with and without name."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Test with provided name
+            custom_name = "my-custom-workload"
+            expected_response = {"name": custom_name, "workloadIdentityId": "workload-123"}
+            mock_cp_client.create_workload_identity.return_value = expected_response
+
+            result = identity_client.create_workload_identity(name=custom_name)
+
+            assert result == expected_response
+            mock_cp_client.create_workload_identity.assert_called_with(
+                name=custom_name, allowedResourceOauth2ReturnUrls=[]
+            )
+
+            # Test without provided name (auto-generated)
+            mock_cp_client.reset_mock()
+            expected_response_auto = {"name": "workload-abcd1234", "workloadIdentityId": "workload-456"}
+            mock_cp_client.create_workload_identity.return_value = expected_response_auto
+
+            with patch("uuid.uuid4") as mock_uuid:
+                mock_uuid.return_value.hex = "abcd1234efgh5678"
+
+                result = identity_client.create_workload_identity()
+
+                assert result == expected_response_auto
+                mock_cp_client.create_workload_identity.assert_called_with(
+                    name="workload-abcd1234", allowedResourceOauth2ReturnUrls=[]
+                )
+
+    def test_update_workload_identity(self):
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            workload_name = "test-workload"
+            allowed_urls = ["https://unit-test.com/callback", "https://test.com/oauth"]
+            expected_response = {"name": workload_name, "allowedResourceOauth2ReturnUrls": allowed_urls}
+
+            mock_cp_client.update_workload_identity.return_value = expected_response
+
+            result = identity_client.update_workload_identity(
+                name=workload_name,
+                allowed_resource_oauth_2_return_urls=allowed_urls,
+            )
+
+            assert result == expected_response
+            mock_cp_client.update_workload_identity.assert_called_once_with(
+                name=workload_name,
+                allowedResourceOauth2ReturnUrls=allowed_urls,
+            )
+
+    def test_get_workload_identity(self):
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            workload_name = "test-workload"
+            expected_response = {"name": workload_name}
+
+            mock_cp_client.get_workload_identity.return_value = expected_response
+
+            result = identity_client.get_workload_identity(name=workload_name)
+
+            assert result == expected_response
+            mock_cp_client.get_workload_identity.assert_called_once_with(
+                name=workload_name,
+            )
+
+    def test_complete_resource_token_auth_with_user_id(self):
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            session_uri = "https://unit-test.com/session/123"
+            user_id = "test-user-123"
+            user_identifier = UserIdIdentifier(user_id=user_id)
+            expected_response = {}
+
+            mock_dp_client.complete_resource_token_auth.return_value = expected_response
+
+            result = identity_client.complete_resource_token_auth(session_uri, user_identifier)
+
+            assert result == expected_response
+            mock_dp_client.complete_resource_token_auth.assert_called_once_with(
+                userIdentifier={"userId": user_id}, sessionUri=session_uri
+            )
+
+    def test_complete_resource_token_auth_with_user_token(self):
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            session_uri = "https://example.com/session/456"
+            user_token = "user-unit-test-token"
+            user_identifier = UserTokenIdentifier(user_token=user_token)
+            expected_response = {}
+
+            mock_dp_client.complete_resource_token_auth.return_value = expected_response
+
+            result = identity_client.complete_resource_token_auth(session_uri, user_identifier)
+
+            assert result == expected_response
+            mock_dp_client.complete_resource_token_auth.assert_called_once_with(
+                userIdentifier={"userToken": user_token}, sessionUri=session_uri
+            )
+
+    def test_complete_resource_token_auth_with_invalid_identifier(self):
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            session_uri = "https://unit-test.com/session/789"
+            invalid_identifier = "invalid-string"  # Not a UserIdIdentifier or UserTokenIdentifier
+
+            with pytest.raises(ValueError, match="Unexpected UserIdentifier"):
+                identity_client.complete_resource_token_auth(session_uri, invalid_identifier)  # type: ignore - unit test
+
+    def test_create_payment_credential_provider(self):
+        """Test create_payment_credential_provider."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            name = "test-payment-provider"
+            vendor = "CoinbaseCDP"
+            config = {
+                "apiKeyId": "test-api-key-id",
+                "apiKeySecret": "test-api-key-secret",
+                "walletSecret": "test-wallet-secret",
+            }
+            arn = "arn:aws:acps:us-west-2:123456789012:token-vault/test/paymentcredentialprovider/test-payment-provider"
+            expected_response = {
+                "name": name,
+                "credentialProviderVendor": vendor,
+                "credentialProviderArn": arn,
+            }
+
+            mock_cp_client.create_payment_credential_provider.return_value = expected_response
+
+            result = identity_client.create_payment_credential_provider(name, vendor, config)
+
+            assert result == expected_response
+            mock_cp_client.create_payment_credential_provider.assert_called_once_with(
+                name=name, credentialProviderVendor=vendor, providerConfigurationInput=config
+            )
+
+    def test_update_payment_credential_provider(self):
+        """Test update_payment_credential_provider."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            name = "test-payment-provider"
+            vendor = "CoinbaseCDP"
+            config = {
+                "apiKeyId": "updated-api-key-id",
+                "apiKeySecret": "updated-api-key-secret",
+                "walletSecret": "updated-wallet-secret",
+            }
+            arn = "arn:aws:acps:us-west-2:123456789012:token-vault/test/paymentcredentialprovider/test-payment-provider"
+            expected_response = {
+                "name": name,
+                "credentialProviderVendor": vendor,
+                "credentialProviderArn": arn,
+            }
+
+            mock_cp_client.update_payment_credential_provider.return_value = expected_response
+
+            result = identity_client.update_payment_credential_provider(name, vendor, config)
+
+            assert result == expected_response
+            mock_cp_client.update_payment_credential_provider.assert_called_once_with(
+                name=name, credentialProviderVendor=vendor, providerConfigurationInput=config
+            )
+
+    def test_delete_payment_credential_provider(self):
+        """Test delete_payment_credential_provider."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            name = "test-payment-provider"
+            expected_response = {}
+
+            mock_cp_client.delete_payment_credential_provider.return_value = expected_response
+
+            result = identity_client.delete_payment_credential_provider(name)
+
+            assert result == expected_response
+            mock_cp_client.delete_payment_credential_provider.assert_called_once_with(name=name)
+
+    def test_get_payment_credential_provider(self):
+        """Test get_payment_credential_provider."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            name = "test-payment-provider"
+            arn = "arn:aws:acps:us-west-2:123456789012:token-vault/test/paymentcredentialprovider/test-payment-provider"
+            expected_response = {
+                "name": name,
+                "credentialProviderVendor": "CoinbaseCDP",
+                "credentialProviderArn": arn,
+                "createdTime": "2024-01-01T00:00:00Z",
+                "lastUpdatedTime": "2024-01-01T00:00:00Z",
+            }
+
+            mock_cp_client.get_payment_credential_provider.return_value = expected_response
+
+            result = identity_client.get_payment_credential_provider(name)
+
+            assert result == expected_response
+            mock_cp_client.get_payment_credential_provider.assert_called_once_with(name=name)
+
+    def test_list_payment_credential_providers_without_pagination(self):
+        """Test list_payment_credential_providers without pagination parameters."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            arn1 = "arn:aws:acps:us-west-2:123456789012:token-vault/test/paymentcredentialprovider/provider-1"
+            arn2 = "arn:aws:acps:us-west-2:123456789012:token-vault/test/paymentcredentialprovider/provider-2"
+            expected_response = {
+                "credentialProviders": [
+                    {
+                        "name": "provider-1",
+                        "credentialProviderVendor": "CoinbaseCDP",
+                        "credentialProviderArn": arn1,
+                        "createdTime": "2024-01-01T00:00:00Z",
+                        "lastUpdatedTime": "2024-01-01T00:00:00Z",
+                    },
+                    {
+                        "name": "provider-2",
+                        "credentialProviderVendor": "CoinbaseCDP",
+                        "credentialProviderArn": arn2,
+                        "createdTime": "2024-01-02T00:00:00Z",
+                        "lastUpdatedTime": "2024-01-02T00:00:00Z",
+                    },
+                ]
+            }
+
+            mock_cp_client.list_payment_credential_providers.return_value = expected_response
+
+            result = identity_client.list_payment_credential_providers()
+
+            assert result == expected_response
+            mock_cp_client.list_payment_credential_providers.assert_called_once_with()
+
+    def test_list_payment_credential_providers_with_pagination(self):
+        """Test list_payment_credential_providers with pagination parameters."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            next_token = "test-next-token"
+            max_results = 10
+            arn = "arn:aws:acps:us-west-2:123456789012:token-vault/test/paymentcredentialprovider/provider-1"
+            expected_response = {
+                "credentialProviders": [
+                    {
+                        "name": "provider-1",
+                        "credentialProviderVendor": "CoinbaseCDP",
+                        "credentialProviderArn": arn,
+                        "createdTime": "2024-01-01T00:00:00Z",
+                        "lastUpdatedTime": "2024-01-01T00:00:00Z",
+                    }
+                ],
+                "nextToken": "next-page-token",
+            }
+
+            mock_cp_client.list_payment_credential_providers.return_value = expected_response
+
+            result = identity_client.list_payment_credential_providers(next_token=next_token, max_results=max_results)
+
+            assert result == expected_response
+            mock_cp_client.list_payment_credential_providers.assert_called_once_with(
+                nextToken=next_token, maxResults=max_results
+            )
+
+    def test_list_payment_credential_providers_with_next_token_only(self):
+        """Test list_payment_credential_providers with only next_token parameter."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            next_token = "test-next-token"
+            arn = "arn:aws:acps:us-west-2:123456789012:token-vault/test/paymentcredentialprovider/provider-3"
+            expected_response = {
+                "credentialProviders": [
+                    {
+                        "name": "provider-3",
+                        "credentialProviderVendor": "CoinbaseCDP",
+                        "credentialProviderArn": arn,
+                        "createdTime": "2024-01-03T00:00:00Z",
+                        "lastUpdatedTime": "2024-01-03T00:00:00Z",
+                    }
+                ]
+            }
+
+            mock_cp_client.list_payment_credential_providers.return_value = expected_response
+
+            result = identity_client.list_payment_credential_providers(next_token=next_token)
+
+            assert result == expected_response
+            mock_cp_client.list_payment_credential_providers.assert_called_once_with(nextToken=next_token)
+
+    def test_list_payment_credential_providers_with_max_results_only(self):
+        """Test list_payment_credential_providers with only max_results parameter."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Test data
+            max_results = 5
+            arn = "arn:aws:acps:us-west-2:123456789012:token-vault/test/paymentcredentialprovider/provider-1"
+            expected_response = {
+                "credentialProviders": [
+                    {
+                        "name": "provider-1",
+                        "credentialProviderVendor": "CoinbaseCDP",
+                        "credentialProviderArn": arn,
+                        "createdTime": "2024-01-01T00:00:00Z",
+                        "lastUpdatedTime": "2024-01-01T00:00:00Z",
+                    }
+                ]
+            }
+
+            mock_cp_client.list_payment_credential_providers.return_value = expected_response
+
+            result = identity_client.list_payment_credential_providers(max_results=max_results)
+
+            assert result == expected_response
+            mock_cp_client.list_payment_credential_providers.assert_called_once_with(maxResults=max_results)
+
+    def test_list_payment_credential_providers_with_zero_max_results(self):
+        """Test list_payment_credential_providers validates max_results=0."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # max_results=0 should raise ValueError (outside valid range 1-20)
+            with pytest.raises(ValueError, match="max_results must be between 1 and 20"):
+                identity_client.list_payment_credential_providers(max_results=0)
+
+    def test_list_payment_credential_providers_with_empty_next_token(self):
+        """Test list_payment_credential_providers with next_token="" (edge case)."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Test data - next_token="" should be passed through, not treated as falsy
+            next_token = ""
+            expected_response = {"credentialProviders": []}
+
+            mock_cp_client.list_payment_credential_providers.return_value = expected_response
+
+            result = identity_client.list_payment_credential_providers(next_token=next_token)
+
+            assert result == expected_response
+            mock_cp_client.list_payment_credential_providers.assert_called_once_with(nextToken="")
+
+    def test_create_payment_credential_provider_client_error(self):
+        """Test create_payment_credential_provider propagates ClientError."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Mock boto3 to raise ClientError
+            error_response = {"Error": {"Code": "ProviderNotFound", "Message": "Provider not found"}}
+            mock_cp_client.create_payment_credential_provider.side_effect = ClientError(
+                error_response, "CreatePaymentCredentialProvider"
+            )
+
+            with pytest.raises(ClientError):
+                identity_client.create_payment_credential_provider("test-provider", "CoinbaseCDP", {})
+
+    def test_update_payment_credential_provider_client_error(self):
+        """Test update_payment_credential_provider propagates ClientError."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Mock boto3 to raise ClientError
+            error_response = {"Error": {"Code": "AccessDenied", "Message": "Access denied"}}
+            mock_cp_client.update_payment_credential_provider.side_effect = ClientError(
+                error_response, "UpdatePaymentCredentialProvider"
+            )
+
+            with pytest.raises(ClientError):
+                identity_client.update_payment_credential_provider("test-provider", "CoinbaseCDP", {})
+
+    def test_delete_payment_credential_provider_client_error(self):
+        """Test delete_payment_credential_provider propagates ClientError."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Mock boto3 to raise ClientError
+            error_response = {"Error": {"Code": "ProviderNotFound", "Message": "Provider not found"}}
+            mock_cp_client.delete_payment_credential_provider.side_effect = ClientError(
+                error_response, "DeletePaymentCredentialProvider"
+            )
+
+            with pytest.raises(ClientError):
+                identity_client.delete_payment_credential_provider("test-provider")
+
+    def test_get_payment_credential_provider_client_error(self):
+        """Test get_payment_credential_provider propagates ClientError."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Mock boto3 to raise ClientError
+            error_response = {"Error": {"Code": "ProviderNotFound", "Message": "Provider not found"}}
+            mock_cp_client.get_payment_credential_provider.side_effect = ClientError(
+                error_response, "GetPaymentCredentialProvider"
+            )
+
+            with pytest.raises(ClientError):
+                identity_client.get_payment_credential_provider("test-provider")
+
+    def test_list_payment_credential_providers_client_error(self):
+        """Test list_payment_credential_providers propagates ClientError."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            # Mock boto3 to raise ClientError
+            error_response = {"Error": {"Code": "ServiceUnavailable", "Message": "Service unavailable"}}
+            mock_cp_client.list_payment_credential_providers.side_effect = ClientError(
+                error_response, "ListPaymentCredentialProviders"
+            )
+
+            with pytest.raises(ClientError):
+                identity_client.list_payment_credential_providers()
+
+    def test_list_payment_credential_providers_max_results_below_range(self):
+        """Test list_payment_credential_providers validates max_results < 1."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            with pytest.raises(ValueError, match="max_results must be between 1 and 20"):
+                identity_client.list_payment_credential_providers(max_results=0)
+
+    def test_list_payment_credential_providers_max_results_above_range(self):
+        """Test list_payment_credential_providers validates max_results > 20."""
+        region = "us-west-2"
+
+        with patch("boto3.client") as mock_boto_client:
+            mock_cp_client = Mock()
+            mock_dp_client = Mock()
+            mock_boto_client.side_effect = [mock_cp_client, mock_dp_client]
+
+            identity_client = IdentityClient(region)
+
+            with pytest.raises(ValueError, match="max_results must be between 1 and 20"):
+                identity_client.list_payment_credential_providers(max_results=50)
+
+
+class TestDefaultApiTokenPoller:
+    """Test DefaultApiTokenPoller implementation."""
+
+    def test_initialization(self):
+        """Test DefaultApiTokenPoller initialization."""
+        auth_url = "https://example.com/auth"
+        mock_func = Mock()
+
+        poller = _DefaultApiTokenPoller(auth_url, mock_func)
+
+        assert poller.auth_url == auth_url
+        assert poller.polling_func == mock_func
+
+    @pytest.mark.asyncio
+    async def test_poll_for_token_success_immediate(self):
+        """Test successful token polling that returns immediately."""
+        auth_url = "https://example.com/auth"
+        expected_token = "test-token-123"
+        mock_func = Mock(return_value=expected_token)
+
+        poller = _DefaultApiTokenPoller(auth_url, mock_func)
+
+        with patch("asyncio.sleep") as mock_sleep:
+            token = await poller.poll_for_token()
+
+            assert token == expected_token
+            mock_func.assert_called_once()
+            mock_sleep.assert_called_once_with(DEFAULT_POLLING_INTERVAL_SECONDS)
+
+    @pytest.mark.asyncio
+    async def test_poll_for_token_success_after_retries(self):
+        """Test successful token polling after several retries."""
+        auth_url = "https://example.com/auth"
+        expected_token = "test-token-456"
+
+        # Mock function returns None twice, then returns token
+        mock_func = Mock(side_effect=[None, None, expected_token])
+
+        poller = _DefaultApiTokenPoller(auth_url, mock_func)
+
+        with patch("asyncio.sleep") as mock_sleep:
+            token = await poller.poll_for_token()
+
+            assert token == expected_token
+            assert mock_func.call_count == 3
+            assert mock_sleep.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_poll_for_token_timeout(self):
+        """Test that polling times out after the configured timeout."""
+        auth_url = "https://example.com/auth"
+        mock_func = Mock(return_value=None)  # Always returns None
+
+        poller = _DefaultApiTokenPoller(auth_url, mock_func)
+
+        # Mock time.time to simulate timeout quickly
+        start_time = 1000.0
+        timeout_time = start_time + DEFAULT_POLLING_TIMEOUT_SECONDS + 1
+
+        with patch("time.time", side_effect=[start_time, timeout_time]):
+            with patch("asyncio.sleep"):
+                with pytest.raises(asyncio.TimeoutError) as exc_info:
+                    await poller.poll_for_token()
+
+                assert "Polling timed out" in str(exc_info.value)
+                assert f"{DEFAULT_POLLING_TIMEOUT_SECONDS} seconds" in str(exc_info.value)

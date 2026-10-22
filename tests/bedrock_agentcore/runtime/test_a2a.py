@@ -1,0 +1,608 @@
+import contextvars
+import logging
+import uuid
+from unittest.mock import patch
+
+import pytest
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
+from a2a.types import AgentCapabilities, AgentCard, AgentSkill, Part
+from starlette.testclient import TestClient
+
+try:
+    from a2a.types import StreamResponse  # noqa: F401
+except ImportError:
+    from a2a.types import TextPart
+    from a2a.utils import new_task as _new_task
+
+    IS_A2A_V1 = False
+else:
+    from a2a.helpers import new_task_from_user_message as _new_task
+    from a2a.types import AgentInterface
+
+    IS_A2A_V1 = True
+
+from bedrock_agentcore.runtime.a2a import (
+    BedrockCallContextBuilder,
+    build_a2a_app,
+    build_runtime_url,
+    serve_a2a,
+)
+from bedrock_agentcore.runtime.context import BedrockAgentCoreContext
+from bedrock_agentcore.runtime.models import PingStatus
+
+
+class _EchoExecutor(AgentExecutor):
+    """Echoes user input back as an artifact. Records call_context for inspection."""
+
+    def __init__(self):
+        self.last_call_context = None
+
+    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        self.last_call_context = context.call_context
+        task = context.current_task or _new_task(context.message)
+        if not context.current_task:
+            await event_queue.enqueue_event(task)
+        updater = TaskUpdater(event_queue, task.id, task.context_id)
+        user_text = context.get_user_input()
+        await updater.add_artifact([_text_part(f"echo: {user_text}")])
+        await updater.complete()
+
+    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+        pass
+
+
+def _make_agent_card() -> AgentCard:
+    card_kwargs = {
+        "name": "test-agent",
+        "description": "A test agent",
+        "version": "1.0.0",
+        "capabilities": AgentCapabilities(streaming=True),
+        "skills": [AgentSkill(id="echo", name="echo", description="Echoes input", tags=["echo"])],
+        "default_input_modes": ["text"],
+        "default_output_modes": ["text"],
+    }
+    if not IS_A2A_V1:
+        return AgentCard(url="http://localhost:9000", **card_kwargs)
+    return AgentCard(
+        **card_kwargs,
+        supported_interfaces=[
+            AgentInterface(
+                protocol_binding="JSONRPC",
+                protocol_version="1.0",
+                url="http://localhost:9000",
+            )
+        ],
+    )
+
+
+def _text_part(text: str) -> Part:
+    if IS_A2A_V1:
+        return Part(text=text)
+    return Part(root=TextPart(text=text))
+
+
+def _test_client(app, **kwargs) -> TestClient:
+    headers = {"A2A-Version": "1.0"} if IS_A2A_V1 else None
+    return TestClient(app, headers=headers, **kwargs)
+
+
+def _method(v1: str, v03: str) -> str:
+    return v1 if IS_A2A_V1 else v03
+
+
+def _task_result(body: dict) -> dict:
+    result = body["result"]
+    return result["task"] if IS_A2A_V1 else result
+
+
+def _completed_state() -> str:
+    return "TASK_STATE_COMPLETED" if IS_A2A_V1 else "completed"
+
+
+def _card_url(card: AgentCard) -> str:
+    return card.supported_interfaces[0].url if IS_A2A_V1 else card.url
+
+
+def _card_response_url(body: dict) -> str:
+    return body["supportedInterfaces"][0]["url"] if IS_A2A_V1 else body["url"]
+
+
+def _jsonrpc_request(method: str, params: dict | None = None) -> dict:
+    body: dict = {"jsonrpc": "2.0", "method": method, "id": 1}
+    if params is not None:
+        body["params"] = params
+    return body
+
+
+def _send_message_params(text: str = "hello") -> dict:
+    if not IS_A2A_V1:
+        return {
+            "message": {
+                "message_id": str(uuid.uuid4()),
+                "role": "user",
+                "parts": [{"kind": "text", "text": text}],
+            }
+        }
+    return {
+        "message": {
+            "messageId": str(uuid.uuid4()),
+            "role": "ROLE_USER",
+            "parts": [{"text": text}],
+        }
+    }
+
+
+class TestBuildA2AApp:
+    def test_ping_returns_healthy_without_timestamp(self):
+        app = build_a2a_app(_EchoExecutor(), _make_agent_card())
+        client = TestClient(app)
+        resp = client.get("/ping")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "Healthy"
+        assert "time_of_last_update" not in body
+
+    def test_custom_ping_handler(self):
+        app = build_a2a_app(
+            _EchoExecutor(),
+            _make_agent_card(),
+            ping_handler=lambda: PingStatus.HEALTHY_BUSY,
+        )
+        client = TestClient(app)
+        resp = client.get("/ping")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "HealthyBusy"
+
+    def test_ping_fallback_on_error(self):
+        def bad_ping():
+            raise RuntimeError("boom")
+
+        app = build_a2a_app(
+            _EchoExecutor(),
+            _make_agent_card(),
+            ping_handler=bad_ping,
+        )
+        client = TestClient(app)
+        resp = client.get("/ping")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "Healthy"
+
+    def test_agent_card_returns_card_data(self):
+        app = build_a2a_app(_EchoExecutor(), _make_agent_card())
+        client = TestClient(app)
+        resp = client.get("/.well-known/agent-card.json")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["name"] == "test-agent"
+        assert body["version"] == "1.0.0"
+        assert body["skills"][0]["id"] == "echo"
+
+    def test_message_send_executes_and_returns_completed_task(self):
+        """Verify the full RPC path: JSON-RPC request -> executor -> completed task."""
+        app = build_a2a_app(_EchoExecutor(), _make_agent_card())
+        client = _test_client(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/",
+            json=_jsonrpc_request(_method("SendMessage", "message/send"), _send_message_params("unit-test")),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "result" in body
+        task = _task_result(body)
+        assert task["status"]["state"] == _completed_state()
+        assert task["artifacts"][0]["parts"][0]["text"] == "echo: unit-test"
+
+    @pytest.mark.skipif(not IS_A2A_V1, reason="v0.3 compatibility routes are provided by a2a-sdk v1")
+    def test_v03_message_send_remains_compatible(self):
+        app = build_a2a_app(_EchoExecutor(), _make_agent_card())
+        client = TestClient(app, raise_server_exceptions=False)
+        params = {
+            "message": {
+                "message_id": str(uuid.uuid4()),
+                "role": "user",
+                "parts": [{"kind": "text", "text": "compat"}],
+            }
+        }
+
+        resp = client.post("/", json=_jsonrpc_request("message/send", params))
+
+        assert resp.status_code == 200
+        assert resp.json()["result"]["status"]["state"] == "completed"
+        assert resp.json()["result"]["artifacts"][0]["parts"][0]["text"] == "echo: compat"
+
+    def test_custom_task_store_is_used_for_persistence(self):
+        """Verify that a custom task_store actually stores the task."""
+        store = InMemoryTaskStore()
+        app = build_a2a_app(_EchoExecutor(), _make_agent_card(), task_store=store)
+        client = _test_client(app, raise_server_exceptions=False)
+
+        # Send a message so a task gets created
+        resp = client.post(
+            "/",
+            json=_jsonrpc_request(_method("SendMessage", "message/send"), _send_message_params("store-test")),
+        )
+        task_id = _task_result(resp.json())["id"]
+
+        # Retrieve from the same store via tasks/get
+        resp2 = client.post("/", json=_jsonrpc_request(_method("GetTask", "tasks/get"), {"id": task_id}))
+        assert resp2.json()["result"]["id"] == task_id
+
+    def test_agent_card_url_auto_populated_from_env(self):
+        """When AGENTCORE_RUNTIME_URL is set, the agent card URL is overridden."""
+        card = _make_agent_card()
+        assert _card_url(card) == "http://localhost:9000"
+        with patch.dict("os.environ", {"AGENTCORE_RUNTIME_URL": "https://deployed.example.com/"}):
+            build_a2a_app(_EchoExecutor(), card)
+        assert _card_url(card) == "https://deployed.example.com/"
+
+    def test_agent_card_url_uses_explicit_runtime_url(self):
+        """A supplied runtime_url overrides the URL on an explicit card."""
+        card = _make_agent_card()
+        with patch.dict("os.environ", {}, clear=True):
+            build_a2a_app(_EchoExecutor(), card, runtime_url="http://localhost:9002/")
+        assert _card_url(card) == "http://localhost:9002/"
+
+    def test_agent_card_url_unchanged_without_env(self):
+        """Without a runtime URL override, an explicit card URL stays as-is."""
+        card = _make_agent_card()
+        original_url = _card_url(card)
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+
+            os.environ.pop("AGENTCORE_RUNTIME_URL", None)
+            build_a2a_app(_EchoExecutor(), card)
+        assert _card_url(card) == original_url
+
+    def test_auto_builds_card_when_none_provided(self):
+        """When agent_card is omitted, a default card is built automatically."""
+        app = build_a2a_app(_EchoExecutor())
+        client = TestClient(app)
+        resp = client.get("/.well-known/agent-card.json")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["name"] == "agent"
+        assert _card_response_url(body) == "http://localhost:9000/"
+
+    def test_auto_builds_card_from_strands_executor(self):
+        """When executor has .agent with name/description, card is built from it."""
+
+        class _FakeAgent:
+            name = "My Strands Agent"
+            description = "Does cool stuff"
+
+        executor = _EchoExecutor()
+        executor.agent = _FakeAgent()  # type: ignore[attr-defined]
+
+        app = build_a2a_app(executor)
+        client = TestClient(app)
+        resp = client.get("/.well-known/agent-card.json")
+        body = resp.json()
+        assert body["name"] == "My Strands Agent"
+        assert body["description"] == "Does cool stuff"
+
+    def test_auto_card_uses_runtime_url_env(self):
+        """Auto-built card picks up AGENTCORE_RUNTIME_URL."""
+        with patch.dict("os.environ", {"AGENTCORE_RUNTIME_URL": "https://prod.example.com/"}):
+            app = build_a2a_app(_EchoExecutor())
+        client = TestClient(app)
+        resp = client.get("/.well-known/agent-card.json")
+        assert _card_response_url(resp.json()) == "https://prod.example.com/"
+
+
+class TestBedrockCallContextBuilder:
+    def _run_in_isolated_context(self, fn):
+        """Run fn in a fresh contextvars.Context so tests don't leak state."""
+        ctx = contextvars.copy_context()
+        return ctx.run(fn)
+
+    def test_extracts_all_bedrock_headers(self):
+        """Verify every Bedrock header is extracted into both ServerCallContext.state and contextvars."""
+
+        def _test():
+            from starlette.requests import Request
+
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/",
+                "headers": [
+                    (b"x-amzn-bedrock-agentcore-runtime-session-id", b"sess-abc"),
+                    (b"x-amzn-bedrock-agentcore-runtime-request-id", b"req-456"),
+                    (b"workloadaccesstoken", b"tok-xyz"),
+                    (b"oauth2callbackurl", b"https://callback.example.com"),
+                    (b"x-amzn-bedrock-agentcore-runtime-custom-foo", b"bar"),
+                    (b"authorization", b"Bearer test-token"),
+                ],
+                "query_string": b"",
+            }
+            request = Request(scope)
+            builder = BedrockCallContextBuilder()
+            result = builder.build(request)
+
+            # Check ServerCallContext state dict
+            assert result.state["session_id"] == "sess-abc"
+            assert result.state["request_id"] == "req-456"
+            assert result.state["workload_access_token"] == "tok-xyz"
+            assert result.state["oauth2_callback_url"] == "https://callback.example.com"
+
+            # Check contextvars were actually set
+            assert BedrockAgentCoreContext.get_session_id() == "sess-abc"
+            assert BedrockAgentCoreContext.get_request_id() == "req-456"
+            assert BedrockAgentCoreContext.get_workload_access_token() == "tok-xyz"
+            assert BedrockAgentCoreContext.get_oauth2_callback_url() == "https://callback.example.com"
+
+            # Check custom + authorization headers collected
+            headers = BedrockAgentCoreContext.get_request_headers()
+            assert headers is not None
+            assert "Authorization" in headers or "authorization" in headers
+            custom_found = any(k.lower().startswith("x-amzn-bedrock-agentcore-runtime-custom-") for k in headers)
+            assert custom_found
+
+        self._run_in_isolated_context(_test)
+
+    def test_forwards_non_restricted_custom_headers(self):
+        """Non-restricted headers (e.g. X-Api-Key) are forwarded; restricted ones are not."""
+
+        def _test():
+            from starlette.requests import Request
+
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/",
+                "headers": [
+                    (b"x-api-key", b"my-key"),
+                    (b"x-custom-signature", b"sha256=abc"),
+                    (b"content-type", b"application/json"),  # restricted
+                    (b"x-amz-date", b"20250101T000000Z"),  # restricted (x-amz-)
+                    (b"x-amzn-trace-id", b"trace-123"),  # restricted (x-amzn-)
+                ],
+                "query_string": b"",
+            }
+            request = Request(scope)
+            builder = BedrockCallContextBuilder()
+            builder.build(request)
+
+            headers = BedrockAgentCoreContext.get_request_headers()
+            assert headers is not None
+            assert any(k.lower() == "x-api-key" for k in headers)
+            assert any(k.lower() == "x-custom-signature" for k in headers)
+            assert not any(k.lower() == "content-type" for k in headers)
+            assert not any(k.lower() == "x-amz-date" for k in headers)
+            assert not any(k.lower() == "x-amzn-trace-id" for k in headers)
+
+        self._run_in_isolated_context(_test)
+
+    def test_auto_generates_request_id_when_missing(self):
+        def _test():
+            from starlette.requests import Request
+
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/",
+                "headers": [],
+                "query_string": b"",
+            }
+            request = Request(scope)
+            builder = BedrockCallContextBuilder()
+            result = builder.build(request)
+
+            generated_id = result.state["request_id"]
+            assert generated_id is not None
+            # Verify it's a valid UUID
+            uuid.UUID(generated_id)
+            assert BedrockAgentCoreContext.get_request_id() == generated_id
+
+        self._run_in_isolated_context(_test)
+
+    def test_optional_headers_omitted_from_state_when_absent(self):
+        """When optional headers (token, oauth2) are missing, they must not appear in state."""
+
+        def _test():
+            from starlette.requests import Request
+
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/",
+                "headers": [
+                    (b"x-amzn-bedrock-agentcore-runtime-session-id", b"sess-only"),
+                ],
+                "query_string": b"",
+            }
+            request = Request(scope)
+            builder = BedrockCallContextBuilder()
+            result = builder.build(request)
+
+            assert result.state["session_id"] == "sess-only"
+            assert "workload_access_token" not in result.state
+            assert "oauth2_callback_url" not in result.state
+
+        self._run_in_isolated_context(_test)
+
+    def test_headers_reach_executor_through_full_app(self):
+        """End-to-end: HTTP headers -> CallContextBuilder -> a2a-sdk -> executor.call_context."""
+
+        def _test():
+            executor = _EchoExecutor()
+            builder = BedrockCallContextBuilder()
+            app = build_a2a_app(executor, _make_agent_card(), context_builder=builder)
+            client = _test_client(app, raise_server_exceptions=False)
+
+            client.post(
+                "/",
+                json=_jsonrpc_request(_method("SendMessage", "message/send"), _send_message_params("ctx-test")),
+                headers={
+                    "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": "unit-sess",
+                    "X-Amzn-Bedrock-AgentCore-Runtime-Request-Id": "unit-req",
+                    "WorkloadAccessToken": "unit-token",
+                },
+            )
+
+            ctx = executor.last_call_context
+            assert ctx is not None
+            assert ctx.state["session_id"] == "unit-sess"
+            assert ctx.state["bedrock_request_id"] == "unit-req"
+            assert ctx.state["workload_access_token"] == "unit-token"
+
+        self._run_in_isolated_context(_test)
+
+
+class TestServeA2A:
+    @patch("uvicorn.run")
+    def test_default_localhost(self, mock_uvicorn_run):
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+
+            os.environ.pop("A2A_PORT", None)
+            with patch("os.path.exists", return_value=False):
+                serve_a2a(_EchoExecutor(), _make_agent_card())
+        kw = mock_uvicorn_run.call_args[1]
+        assert kw["host"] == "127.0.0.1"
+        assert kw["port"] == 9000
+
+    @patch("uvicorn.run")
+    def test_port_from_environment(self, mock_uvicorn_run):
+        with patch.dict("os.environ", {"A2A_PORT": "9001"}, clear=True):
+            serve_a2a(_EchoExecutor())
+
+        app = mock_uvicorn_run.call_args.args[0]
+        response = TestClient(app).get("/.well-known/agent-card.json")
+        assert mock_uvicorn_run.call_args.kwargs["port"] == 9001
+        assert _card_response_url(response.json()) == "http://localhost:9001/"
+
+    @patch("uvicorn.run")
+    def test_port_from_environment_updates_explicit_card(self, mock_uvicorn_run):
+        with patch.dict("os.environ", {"A2A_PORT": "9002"}, clear=True):
+            serve_a2a(_EchoExecutor(), _make_agent_card())
+
+        app = mock_uvicorn_run.call_args.args[0]
+        response = TestClient(app).get("/.well-known/agent-card.json")
+        assert mock_uvicorn_run.call_args.kwargs["port"] == 9002
+        assert _card_response_url(response.json()) == "http://localhost:9002/"
+
+    @patch("uvicorn.run")
+    def test_explicit_port_overrides_environment(self, mock_uvicorn_run):
+        with patch.dict("os.environ", {"A2A_PORT": "9001"}):
+            serve_a2a(_EchoExecutor(), _make_agent_card(), port=8888)
+        app = mock_uvicorn_run.call_args.args[0]
+        response = TestClient(app).get("/.well-known/agent-card.json")
+        assert mock_uvicorn_run.call_args.kwargs["port"] == 8888
+        assert _card_response_url(response.json()) == "http://localhost:8888/"
+
+    @patch("uvicorn.run")
+    def test_runtime_url_environment_overrides_port_for_card(self, mock_uvicorn_run):
+        with patch.dict(
+            "os.environ",
+            {
+                "A2A_PORT": "9002",
+                "AGENTCORE_RUNTIME_URL": "https://deployed.example.com/",
+            },
+            clear=True,
+        ):
+            serve_a2a(_EchoExecutor(), _make_agent_card())
+
+        app = mock_uvicorn_run.call_args.args[0]
+        response = TestClient(app).get("/.well-known/agent-card.json")
+        assert mock_uvicorn_run.call_args.kwargs["port"] == 9002
+        assert _card_response_url(response.json()) == "https://deployed.example.com/"
+
+    @patch("uvicorn.run")
+    def test_generic_port_env_var_is_ignored(self, mock_uvicorn_run):
+        """PORT must not affect the A2A port: shared images set it to 8080 for HTTP."""
+        with patch.dict("os.environ", {"PORT": "8080"}, clear=True):
+            serve_a2a(_EchoExecutor(), _make_agent_card())
+
+        app = mock_uvicorn_run.call_args.args[0]
+        response = TestClient(app).get("/.well-known/agent-card.json")
+        assert mock_uvicorn_run.call_args.kwargs["port"] == 9000
+        assert _card_response_url(response.json()) == "http://localhost:9000/"
+
+    @patch("uvicorn.run")
+    def test_a2a_port_takes_precedence_over_generic_port(self, mock_uvicorn_run):
+        with patch.dict("os.environ", {"PORT": "8080", "A2A_PORT": "9003"}, clear=True):
+            serve_a2a(_EchoExecutor(), _make_agent_card())
+
+        assert mock_uvicorn_run.call_args.kwargs["port"] == 9003
+
+    @patch("uvicorn.run")
+    def test_warns_when_binding_non_contract_port(self, mock_uvicorn_run, caplog):
+        with patch.dict("os.environ", {}, clear=True):
+            with caplog.at_level(logging.WARNING, logger="bedrock_agentcore.runtime.a2a"):
+                serve_a2a(_EchoExecutor(), _make_agent_card(), port=8888)
+
+        assert "requires 9000" in caplog.text
+        assert "424" in caplog.text
+
+    @patch("uvicorn.run")
+    def test_no_warning_on_contract_port(self, mock_uvicorn_run, caplog):
+        with patch.dict("os.environ", {}, clear=True):
+            with caplog.at_level(logging.WARNING, logger="bedrock_agentcore.runtime.a2a"):
+                serve_a2a(_EchoExecutor(), _make_agent_card())
+
+        assert caplog.text == ""
+
+    @patch("uvicorn.run")
+    def test_docker_detection_dockerenv(self, mock_uvicorn_run):
+        with patch("os.path.exists", return_value=True):
+            serve_a2a(_EchoExecutor(), _make_agent_card())
+        assert mock_uvicorn_run.call_args[1]["host"] == "0.0.0.0"
+
+    @patch("uvicorn.run")
+    def test_docker_detection_env_var(self, mock_uvicorn_run):
+        with patch.dict("os.environ", {"DOCKER_CONTAINER": "true"}):
+            with patch("os.path.exists", return_value=False):
+                serve_a2a(_EchoExecutor(), _make_agent_card())
+        assert mock_uvicorn_run.call_args[1]["host"] == "0.0.0.0"
+
+    @patch("uvicorn.run")
+    def test_custom_host_port(self, mock_uvicorn_run):
+        serve_a2a(_EchoExecutor(), _make_agent_card(), host="10.0.0.1", port=8888)
+        kw = mock_uvicorn_run.call_args[1]
+        assert kw["host"] == "10.0.0.1"
+        assert kw["port"] == 8888
+
+    @patch("uvicorn.run")
+    def test_kwargs_passthrough(self, mock_uvicorn_run):
+        serve_a2a(
+            _EchoExecutor(),
+            _make_agent_card(),
+            host="127.0.0.1",
+            workers=4,
+            log_level="debug",
+        )
+        kw = mock_uvicorn_run.call_args[1]
+        assert kw["workers"] == 4
+        assert kw["log_level"] == "debug"
+
+    @patch("uvicorn.run")
+    def test_serve_without_agent_card(self, mock_uvicorn_run):
+        """serve_a2a works with just an executor, no card needed."""
+        with patch("os.path.exists", return_value=False):
+            serve_a2a(_EchoExecutor())
+        mock_uvicorn_run.assert_called_once()
+
+
+class TestBuildRuntimeUrl:
+    def test_builds_url_from_arn(self):
+        arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent-abc123"
+        url = build_runtime_url(arn)
+        assert url == (
+            "https://bedrock-agentcore.us-east-1.amazonaws.com"
+            "/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-east-1%3A123456789012%3Aruntime%2Fmy-agent-abc123"
+            "/invocations"
+        )
+
+    def test_region_override(self):
+        arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
+        url = build_runtime_url(arn, region="eu-west-1")
+        assert "bedrock-agentcore.eu-west-1.amazonaws.com" in url
+
+    def test_invalid_arn_raises(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="Cannot extract region"):
+            build_runtime_url("not-an-arn")
